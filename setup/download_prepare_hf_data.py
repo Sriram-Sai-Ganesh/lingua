@@ -143,6 +143,9 @@ def main(dataset, memory, data_dir, seed=42, nchunks=32):
 
 
 if __name__ == "__main__":
+    # sample usage:
+    # python3 setup/download_prepare_hf_data.py fineweb_edu 8 --data_dir=data --seed=42 --nchunks=32
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=str)
     parser.add_argument("memory", type=float, default=8)
@@ -152,4 +155,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    
     main(args.dataset, args.memory, args.data_dir, args.seed, args.nchunks)
