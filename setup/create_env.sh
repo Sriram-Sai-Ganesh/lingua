@@ -1,15 +1,12 @@
 #!/bin/bash
-# Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #SBATCH --job-name=env_creation
+#SBATCH --gpus-per-node=1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:8
-#SBATCH --exclusive
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=128
-#SBATCH --mem=0
-#SBATCH --time=01:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --time=0:30:00
+#SBATCH --partition=a100
 
 # Exit immediately if a command exits with a non-zero status
 set -e
@@ -21,12 +18,11 @@ start_time=$(date +%s)
 current_date=$(date +%y%m%d)
 
 # Create environment name with the current date
-env_prefix=lingua_$current_date
+env_prefix=ling
 
 # Create the conda environment
-
-source $CONDA_ROOT/etc/profile.d/conda.sh
-conda create -n $env_prefix python=3.11 -y -c anaconda
+conda init
+# conda create -n $env_prefix python=3.11 -y -c anaconda
 conda activate $env_prefix
 
 echo "Currently in env $(which python)"
@@ -34,7 +30,7 @@ echo "Currently in env $(which python)"
 # Install packages
 pip install torch==2.7.0 xformers
 pip install ninja
-pip install --requirement requirements.txt
+echo 'y'|pip install --requirement requirements.txt
 
 # End timer
 end_time=$(date +%s)
