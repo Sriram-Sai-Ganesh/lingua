@@ -1,0 +1,69 @@
+name: "wikitext"
+dump_dir: _logs/plusplus
+steps: 25000
+seed: 41
+probe_freq: 100
+grad_acc_steps: 1
+
+optim:
+    lr: 3e-2
+    warmup: 200
+    lr_min_ratio: 0.000001
+    clip: 10.0
+
+distributed:
+    fsdp_type: full_shard
+    compile: false
+    model_dtype: bf16
+    matmul_allow_tf32: false
+    selective_activation_checkpointing: false
+    tp_size: 1
+    dp_shard: 2
+
+model:
+    dim: 64
+    n_layers: 4
+    n_heads: 4
+
+data:
+    root_dir: '/scratch/jeisner1/ssaigan1/datasets/preprocessed/megawika/v1/gpt-neox-olmo-dolma-v1_5'
+    sources:
+        jsonl: 1.0
+    batch_size: 256
+    # prefetch_size: 64
+    seq_len: 256
+    n_views: 2
+    load_async: true
+    add_bos: true
+    add_eos: true
+    tokenizer:
+        name: bytes
+        path: '/scratch/jeisner1/ssaigan1/datasets/preprocessed/megawika/v1/gpt-neox-olmo-dolma-v1_5/jsonl/_tokenizer_cache'
+
+profiling:
+    run: true
+
+checkpoint:
+    dump:
+        every: 1000
+        keep: 10
+    eval:
+        every: 500
+        keep: 10
+
+early_stopping:
+    enabled: false
+    patience: 5
+    min_delta: 0.01
+    metric: "nll_per_token"
+    mode: "min"
+
+logging:
+    freq: 1
+    wandb:
+        project: "lingua_runs"
+        entity: "tilted-transformer"
+
+eval:
+    validation:
+        max_steps: 100
