@@ -1,19 +1,19 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
 
+import json
 import logging
 from collections import namedtuple
-from dataclasses import dataclass, asdict
-from typing import Dict, Any, List, Optional, Union
-from pathlib import Path
-import json
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
 
-from lingua.distributed import get_is_master
 import wandb
+from lingua.distributed import get_is_master
 
 logger = logging.getLogger()
 
@@ -185,10 +185,12 @@ class GPUMemoryMonitor:
 def upload_train_to_wandb(
     ckpt_dir, project="lingua", entity="codegen-team", train=True, eval=True
 ):
-    import wandb
-    from omegaconf import OmegaConf
     import json
     from pathlib import Path
+
+    from omegaconf import OmegaConf
+
+    import wandb
 
     cfg = OmegaConf.load(Path(ckpt_dir) / "config.yaml")
     cfg = OmegaConf.to_container(cfg)
@@ -211,7 +213,7 @@ def upload_train_to_wandb(
                 m = json.loads(l)
                 wandb.log(
                     {
-                        f"evals/{name.replace('/','.')}": value
+                        f"evals/{name.replace('/', '.')}": value
                         for name, value in m.items()
                         if "/" in name
                     },
