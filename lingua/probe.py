@@ -35,7 +35,19 @@ from torch.utils.module_tracker import ModuleTracker
 from torch.fx.operator_schemas import normalize_function
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
-from xformers.ops import fmha
+try:
+    from xformers.ops import fmha
+except ImportError:
+    class _MissingFMHA:
+        @staticmethod
+        def memory_efficient_attention_forward_requires_grad(*args, **kwargs):
+            raise ImportError("xformers is required for xformers attention probing")
+
+        @staticmethod
+        def memory_efficient_attention_forward(*args, **kwargs):
+            raise ImportError("xformers is required for xformers attention probing")
+
+    fmha = _MissingFMHA()
 
 
 @torch.library.custom_op("torchprobe::log", mutates_args=(), device_types=None)
