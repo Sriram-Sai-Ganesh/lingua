@@ -2,21 +2,45 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Union, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
 from torch.nn import functional as F
-from xformers.ops import fmha, AttentionBias
 from torch.nn.attention.flex_attention import (
     BlockMask,
-    flex_attention,
     _mask_mod_signature,
+    flex_attention,
 )
+try:
+    from xformers.ops import AttentionBias, fmha
+except ImportError:
+    class AttentionBias:  # type: ignore[no-redef]
+        pass
+
+    class _MissingAttnBias:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("xformers is required for fmha attention biases")
+
+    class _MissingFMHA:
+        class attn_bias:
+            LocalAttentionFromBottomRightMask = _MissingAttnBias
+            LowerTriangularMask = _MissingAttnBias
+
+        @staticmethod
+        def memory_efficient_attention(*args, **kwargs):
+            raise ImportError("xformers is required for attn_impl='fmha'")
+
+    fmha = _MissingFMHA()
 
 from lingua import probe
 
-flex_attention_comp = torch.compile(flex_attention)
+# Use non-compiled flex_attention to avoid Triton compilation issues
+# when Python dev headers are not available
+flex_attention_comp = flex_attention
+
+# if we want to later compile flex attention:
+# flex_attention_comp = torch.compile(flex_attention)
 
 
 class InitStdFactor(Enum):
@@ -291,6 +315,7 @@ class RMSNorm(nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)  # type: ignore
 
+
 class TiedLinear(nn.Module):
     def __init__(self, tied_module: nn.Module) -> None:
         super().__init__()
@@ -302,6 +327,7 @@ class TiedLinear(nn.Module):
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.tied_module.weight)
+
 
 class Attention(nn.Module):
     def __init__(
@@ -497,13 +523,13 @@ class TransformerBlock(nn.Module):
     def __init__(self, args: BaseTransformerArgs):
         super().__init__()
 
-        assert (args.head_dim is not None) or (
-            args.n_heads is not None
-        ), "Should specify at least head_dim or n_heads"
+        assert (args.head_dim is not None) or (args.n_heads is not None), (
+            "Should specify at least head_dim or n_heads"
+        )
         self.head_dim = args.head_dim or args.dim // args.n_heads
         self.n_heads = args.n_heads or args.dim // args.head_dim
         self.n_kv_heads = args.n_kv_heads or self.n_heads
-        
+
         assert self.n_heads % self.n_kv_heads == 0
         assert args.dim % self.n_heads == 0
 
@@ -531,7 +557,6 @@ class TransformerBlock(nn.Module):
         mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
         attn_impl: str = "sdpa",
     ) -> torch.Tensor:
-
         h = x + self.attention(
             self.attention_norm(x),
             freq_cis,
@@ -574,7 +599,6 @@ class BaseTransformer(nn.Module):
         mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
         attn_impl: str = "sdpa",
     ):
-
         freq_cis = self.rope_embeddings(seqlen=self.max_seqlen, tok_idx=tok_idx)
 
         for i, layer in enumerate(self.layers):
