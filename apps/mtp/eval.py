@@ -70,6 +70,7 @@ def launch_eval(cfg: EvalArgs):
         logger.info(f"Writing metric logs to {metric_log_path}")
         timestamp = {
             "created_at": datetime.utcnow().isoformat(),
+            # "created_at": datetime.now(datetime.timezone.utc).isoformat(),
         }
         if cfg.global_step is not None:
             timestamp["global_step"] = cfg.global_step
