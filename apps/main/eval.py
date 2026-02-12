@@ -1,18 +1,20 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-from collections import defaultdict
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
 import json
 import logging
 import os
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, List, Optional, Tuple, Union
+
+import torch
+from lm_eval import simple_evaluate
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
-from typing import Any, List, Optional, Tuple, Union
-from lm_eval import simple_evaluate
 from omegaconf import OmegaConf
-import torch
+
 from apps.main.generate import (
     PackedCausalTransformerGenerator,
     PackedCausalTransformerGeneratorArgs,
@@ -21,7 +23,7 @@ from apps.main.generate import (
 from apps.main.transformer import LMTransformer, LMTransformerArgs
 from lingua.args import dump_config
 from lingua.checkpoint import CONSOLIDATE_FOLDER, consolidate_checkpoints
-from lingua.data import init_choice_state, setup_sources
+from lingua.data import distribute_data_to_rank, loop_on_jsonl
 from lingua.distributed import (
     DistributedArgs,
     dist_mean_dict,
@@ -31,6 +33,11 @@ from lingua.distributed import (
 )
 
 EVAL_FOLDER_NAME = "{:010d}"
+VALIDATION_FILE_PATTERNS = (
+    "*.val.jsonl",
+    "*.validation.jsonl",
+    "*.chunk.*.jsonl",
+)
 
 logger = logging.getLogger()
 
@@ -60,12 +67,16 @@ class LMHarnessArgs:
     torch_random_seed: int = 1234
     fewshot_random_seed: int = 1234
 
+
 @dataclass
 class ValidationArgs:
-    max_steps: Optional[int] = None # If None the whole validation file is used -> /!\ This number of steps is gpu dependent (100 max steps on 8 gpus = 800 steps on 1 gpu)
-    use_val_from_train_src: bool = True # Use the validation set from training sources
+    max_steps: Optional[int] = (
+        None  # If None the whole validation file is used -> /!\ This number of steps is gpu dependent (100 max steps on 8 gpus = 800 steps on 1 gpu)
+    )
+    use_val_from_train_src: bool = True  # Use the validation set from training sources
     root_dir: str = ""
-    sources: List[str] = field(default_factory=list) # Other sources to eval on
+    sources: List[str] = field(default_factory=list)  # Other sources to eval on
+
 
 @dataclass
 class EvalArgs:
@@ -143,7 +154,9 @@ class EvalHarnessLM(LM):
         _, lls, greedy = self.generator.generate(inputs)
         results = []
         for p, ll, gr in zip(prompts, lls, greedy):
-            p_len = len(self.generator.tokenizer.encode(p, add_bos=False, add_eos=False))
+            p_len = len(
+                self.generator.tokenizer.encode(p, add_bos=False, add_eos=False)
+            )
             results.append((ll[p_len:].sum().item(), gr[p_len:].all().item()))
 
         self.generator.max_gen_len = max_gen_len
@@ -161,60 +174,96 @@ class EvalHarnessLM(LM):
         self.generator.max_gen_len = max_gen_len
 
         return results
-    
+
 
 def eval_on_val(generator, val_args: ValidationArgs, train_cfg):
-    srcs = {}
+    src_paths = []
     for src in val_args.sources:
-        path = os.path.join(val_args.root_dir, src)
-        srcs[path] = 1.0
-    for src in train_cfg.data.sources:
-        path = os.path.join(train_cfg.data.root_dir, src)
-        srcs[path] = 1.0
+        src_paths.append(os.path.join(val_args.root_dir, src))
+    if val_args.use_val_from_train_src:
+        for src in train_cfg.data.sources:
+            src_paths.append(os.path.join(train_cfg.data.root_dir, src))
+    # Preserve source order while avoiding duplicate eval on the same directory.
+    src_paths = list(dict.fromkeys(src_paths))
 
-    multi_state = init_choice_state("", srcs, 0, get_global_rank(), get_world_size(), "*.val.jsonl")
-    path_to_iter = setup_sources(multi_state)
+    path_to_iter = {}
+    for src in src_paths:
+        src_path = Path(src)
+        selected_pattern = None
+        for file_pattern in VALIDATION_FILE_PATTERNS:
+            if next(src_path.glob(file_pattern), None) is not None:
+                selected_pattern = file_pattern
+                break
+
+        if selected_pattern is None:
+            raise RuntimeError(
+                "No validation-compatible jsonl files found in "
+                f"{src}. Expected one of {VALIDATION_FILE_PATTERNS}"
+            )
+
+        logger.info(f"Using validation file pattern '{selected_pattern}' for {src}")
+        jsonl_state = distribute_data_to_rank(
+            src, get_global_rank(), get_world_size(), selected_pattern
+        )
+        path_to_iter[src] = loop_on_jsonl(
+            jsonl_state["file_path"],
+            jsonl_state["position"],
+            jsonl_state["block_size"],
+            jsonl_state["offset"],
+            jsonl_state["current_iter"],
+        )
 
     max_gen_len = generator.max_gen_len
     # We temporarily lower max gen len
     generator.max_gen_len = 1
 
     all_val_metrics = {}
-    for src in path_to_iter:
-        jsonl_iterator = path_to_iter[src]
-        texts = []
-        logger.info(f"Running validation on {src}...")
-        for step, (content, state) in enumerate(jsonl_iterator):
-            if state['current_iter'] > 0 or (val_args.max_steps is not None and step >= val_args.max_steps):
-                break
-            content_key = "text" if ("text" in content) else "content"
-            texts.append(content[content_key])
-        
-        _, loglikelihood, _ = generator.generate(texts)
+    try:
+        for src in path_to_iter:
+            jsonl_iterator = path_to_iter[src]
+            texts = []
+            logger.info(f"Running validation on {src}...")
+            for step, (content, state) in enumerate(jsonl_iterator):
+                if state["current_iter"] > 0 or (
+                    val_args.max_steps is not None and step >= val_args.max_steps
+                ):
+                    break
+                content_key = "text" if ("text" in content) else "content"
+                texts.append(content[content_key])
 
-        metrics = defaultdict(list)
-        for i, ll in enumerate(loglikelihood):
-            tmp = ll.sum().item()
-            metrics['nll'].append(tmp)
-            metrics['nll_per_token'].append(tmp / len(ll))
-            metrics['nll_per_char'].append(tmp / len(texts[i]))
+            _, loglikelihood, _ = generator.generate(texts)
 
-            metrics['avg_seqlen'].append(len(ll))
-        
-        for m in metrics:
-            metrics[m] = sum(metrics[m]) / len(metrics[m])
-        metrics.update(dist_mean_dict(metrics))
-        logger.info(f"Validation on {src} done. Metrics: {metrics}")
+            metrics = defaultdict(list)
+            for i, ll in enumerate(loglikelihood):
+                tmp = ll.sum().item()
+                metrics["nll"].append(tmp)
+                metrics["nll_per_token"].append(tmp / len(ll))
+                metrics["nll_per_char"].append(tmp / len(texts[i]))
+                metrics["avg_seqlen"].append(len(ll))
 
-        name = os.path.basename(src)
-        if name in all_val_metrics:
-            logger.warning(f"Duplicate source name {name}, path {src} in validation sources, renaming to {name}_1")
-            name = f"{name}_1"
-        all_val_metrics[name] = metrics
+            for m in metrics:
+                metrics[m] = sum(metrics[m]) / len(metrics[m])
+            metrics.update(dist_mean_dict(metrics))
+            logger.info(f"Validation on {src} done. Metrics: {metrics}")
+
+            name = os.path.basename(src)
+            if name in all_val_metrics:
+                logger.warning(
+                    f"Duplicate source name {name}, path {src} in validation sources, renaming to {name}_1"
+                )
+                name = f"{name}_1"
+            all_val_metrics[name] = metrics
+    finally:
+        for iterator in path_to_iter.values():
+            iterator.close()
 
     generator.max_gen_len = max_gen_len
 
+    logger.info("All validation done. Metrics: ")
+    for name, metrics in all_val_metrics.items():
+        logger.info(f"\t{name}: {metrics}")
     return all_val_metrics
+
 
 def launch_eval(cfg: EvalArgs):
     if not torch.distributed.is_initialized():
@@ -246,32 +295,36 @@ def launch_eval(cfg: EvalArgs):
     generator = PackedCausalTransformerGenerator(cfg.generator, model, tokenizer)
 
     wrap = EvalHarnessLM(generator)
-    results = simple_evaluate(wrap, **asdict(cfg.harness))
-    val_results =  None
+    results = None
+    if cfg.harness and cfg.harness.tasks:
+        results = simple_evaluate(wrap, **asdict(cfg.harness))
+    val_results = None
     if cfg.validation:
         val_results = eval_on_val(generator, cfg.validation, train_cfg)
     if get_global_rank() == 0:
-        with open(Path(cfg.dump_dir) / "results.json", "w") as f:
-            f.write(json.dumps(results))
-        logger.info(f"All evaluation results: {results['results']}")
+        if results is not None:
+            with open(Path(cfg.dump_dir) / "results.json", "w") as f:
+                f.write(json.dumps(results))
+            logger.info(f"All evaluation results: {results['results']}")
         if val_results is not None:
             with open(Path(cfg.dump_dir) / "validation.json", "w") as f:
                 f.write(json.dumps(val_results))
             logger.info(f"All validation results: {val_results}")
     if cfg.metric_log_dir and get_global_rank() == 0:
-        metric_log_path = Path(cfg.metric_log_dir) / "metrics.eval.jsonl"
-
-        logger.info(f"Writing metric logs to {metric_log_path}")
         timestamp = {
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         if cfg.global_step is not None:
             timestamp["global_step"] = cfg.global_step
-        print(
-            json.dumps(timestamp | results["results"]),
-            file=open(metric_log_path, mode="a"),
-            flush=True,
-        )
+
+        if results is not None:
+            metric_log_path = Path(cfg.metric_log_dir) / "metrics.eval.jsonl"
+            logger.info(f"Writing metric logs to {metric_log_path}")
+            print(
+                json.dumps(timestamp | results["results"]),
+                file=open(metric_log_path, mode="a"),
+                flush=True,
+            )
 
         val_log_path = Path(cfg.metric_log_dir) / "metrics.validation.jsonl"
         if val_results is not None:
@@ -280,8 +333,9 @@ def launch_eval(cfg: EvalArgs):
                 file=open(val_log_path, mode="a"),
                 flush=True,
             )
-    
+
     del generator
+    return val_results
 
 
 def main():
