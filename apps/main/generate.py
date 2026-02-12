@@ -1,17 +1,85 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+"""
+This script provides a high-performance generation pipeline for causal language models,
+optimized for handling multiple, variable-length prompts simultaneously through a technique
+called "packing". It is designed to maximize hardware utilization by batching prompts
+and processing them as a single packed sequence, while maintaining the logical separation
+between individual generation processes.
+Core Functionality:
+-------------------
+The main entry point for generation is the `PackedCausalTransformerGenerator` class.
+This class orchestrates the entire process, from tokenization and batching to prefilling
+the KV cache and autoregressive token generation.
+Key Concepts for an NLP PhD Student:
+------------------------------------
+1.  **Prompt Packing:** Instead of padding prompts in a batch to the same length, which
+    can be highly inefficient, this script concatenates tokenized prompts into a single,
+    long sequence (e.g., `[prompt1_tokens, prompt2_tokens, ...]`). This minimizes wasted
+    computation on padding tokens.
+2.  **Two-Phase Generation:** The generation process is split into two distinct phases
+    for maximum efficiency:
+    a.  **Prefilling (Parallel Processing):** The initial packed sequence of prompts is
+        processed in a single, parallel forward pass. A carefully constructed block-diagonal
+        attention mask (`prefill_mask`) ensures that tokens from one prompt can only attend
+        to preceding tokens within the *same* prompt. This phase populates the Key-Value (KV)
+        cache for all prompts at once. The implementation leverages `xformers`'
+        `create_block_mask` for efficient masked attention.
+    b.  **Autoregressive Generation (Batched Decoding):** After prefilling, the script
+        generates subsequent tokens one at a time for all prompts in the batch. In each
+        step, a single forward pass is performed on the last generated token from each
+        sequence. The attention mask (`mask` in `generate_next_token`) is dynamically
+        updated to ensure each new token attends only to its own prompt and the tokens
+        generated for it so far, effectively isolating each sequence within the shared KV cache.
+3.  **Efficient KV Caching (`KVCache`):** A fixed-size KV cache is pre-allocated to accommodate
+    the packed prompts plus the maximum number of tokens to be generated for each. During
+    prefilling and generation, keys and values are written to specific, non-contiguous
+    locations in this cache using `index_copy_`. This avoids re-computing KV pairs for
+    context tokens at each step. An `offset` mechanism within the cache helps manage the
+    write positions for different sequences.
+4.  **Coordinate System for Packed Attention:** The script uses a clever system of token
+    and document IDs (`prefill_tok_id`, `padded_doc_id`, etc.) to manage positions within
+    the packed sequence. These IDs are crucial for:
+    *   **Rotary Position Embeddings (RoPE):** Ensuring correct positional information is
+        applied, as tokens from different prompts are interleaved in the packed sequence.
+    *   **Attention Masking:** Defining which keys a query token is allowed to attend to.
+    *   **KV Cache Updates:** Directing the output of the attention mechanism to the correct
+        slot in the cache.
+5.  **Performance Optimizations:**
+    *   **`torch.compile`:** The `prefill` and `generate_next_token` methods are compiled
+        using `torch.compile` (`mode="reduce-overhead"` for the generation step) to minimize
+        Python overhead and fuse operations into efficient kernels, significantly speeding
+        up inference.
+    *   **Specialized Attention Implementations:** It can switch between different attention
+        backends like `flex_attention` (for the block-diagonal prefill mask) and `sdpa`
+        (standard scaled dot-product attention for generation) to use the most efficient
+        one for the task.
+Helper Functions:
+-----------------
+-   **Sampling Methods (`sample_top_p`, `sample_top_k`, `sample_tokens`):** Standard
+    implementations for nucleus sampling, top-k sampling, and greedy/temperature-based
+    decoding.
+-   **Batching and Packing (`pack_prompts`, `batch_prompts`):** Utilities to prepare
+    prompts by concatenating them and grouping them into batches that fit within the
+    model's maximum token limit (`max_tokens`).
+Execution (`main`):
+-------------------
+The `main` function demonstrates how to use the generator. It loads a consolidated
+model checkpoint, initializes the `PackedCausalTransformerGenerator` with specified
+configurations (e.g., from CLI arguments), accepts multiple prompts from the user,
+runs the generation, and reports the performance in tokens per second."""
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-import time
 from typing import List, Optional
 
 import torch
-from torch import nn
-from tqdm import tqdm
-
-from omegaconf import OmegaConf
-from torch.nn import functional as F
 import xformers
+from omegaconf import OmegaConf
+from torch import nn
+from torch.nn import functional as F
+from torch.nn.attention.flex_attention import create_block_mask
+from tqdm import tqdm
 
 from apps.main.transformer import LMTransformer, LMTransformerArgs
 from lingua.args import dataclass_from_dict
@@ -24,7 +92,6 @@ from lingua.transformer import (
     lengths_to_local_ids,
     lengths_to_start_ids,
 )
-from torch.nn.attention.flex_attention import create_block_mask
 
 
 def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
@@ -364,7 +431,6 @@ class PackedCausalTransformerGenerator:
 
             current_token = start_token
             for i in range(1, self.max_gen_len):
-
                 next_logits = self.generate_next_token(current_token)
                 next_token = sample_tokens(
                     next_logits.clone(), self.temperature, self.top_p, self.top_k
@@ -454,11 +520,20 @@ def main():
 
     # Display the results
     for i, gen in enumerate(generation):
-        print(f"\nPrompt {i+1}: {prompts[i]}")
+        print(f"\nPrompt {i + 1}: {prompts[i]}")
         print(f"Generated Text: {gen}")
 
     print(f"\nTokens per second: {tokens_per_second:.2f}")
 
 
+# sample usage with wikitext.yaml:
+# python -m apps.main.generate ckpt=_logs/plusplus/wiki103_plus_128d_8l/checkpoints/0000025000/consolidated temperature=0.4 top_p=0.9 max_gen_len=100
+
+
 if __name__ == "__main__":
     main()
+
+# detailed summary of the functionality of this file:
+# v103: 582,510     52,458,886  278,712,845
+# v2:   23,767      2,123,211   11,167,405
+# ts:   2,119,489  366,338,652 1,940,273,517
