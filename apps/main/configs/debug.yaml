@@ -1,8 +1,8 @@
 # Template config, need to change dump_dir, data.root_dir and data.tokenizer.path
 
-# dump_dir: !!CHANGETHIS!!
+dump_dir: '/scratch/jeisner1/ssaigan1/lingua/dump_dir'
 name: "debug"
-steps: 1000
+steps: 100000
 probe_freq: 100
 seed: 777
 optim:
@@ -13,28 +13,29 @@ optim:
 
 distributed:
     fsdp_type: full_shard
-    compile: true
+    compile: false
     model_dtype: bf16
     matmul_allow_tf32: false
     selective_activation_checkpointing: false
     tp_size: 1
 
 model:
-    dim: 1024
+    dim: 128
     n_layers: 8
     n_heads: 8
 
 data:
-    root_dir: data/shuffled
+    root_dir: '/scratch/jeisner1/ssaigan1/datasets'
     sources:
-        dclm_baseline_1.0: 1.0
-    batch_size: 32
+        TinyStories: 1.0
+    batch_size: 256
     prefetch_size: 64
     seq_len: 2048
     n_views: 2
     load_async: true
     tokenizer:
         name: bytes
+        path: '/scratch/jeisner1/ssaigan1/lingua/tokenizers'
 
 profiling:
     run: true
@@ -49,6 +50,9 @@ checkpoint:
 
 logging:
     freq: 10
+    wandb:
+        project: "lingua_runs"
+        entity: "tilted-transformer"
 
 eval:
     generator:
