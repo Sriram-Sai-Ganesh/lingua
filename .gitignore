@@ -1,5 +1,8 @@
-*.pyc
-.vscode
-*.ipynb
-slurm-*.out
+*.*sh
+apps/ptransformer
 wandb
+.vscode
+_logs
+**/temp**
+ty.toml
+**pycache*
