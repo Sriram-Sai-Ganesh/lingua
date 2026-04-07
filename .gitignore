@@ -6,3 +6,4 @@ _logs
 **/temp**
 ty.toml
 **pycache*
+plots
